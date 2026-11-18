@@ -47,6 +47,19 @@ pub struct InstallRequest {
     pub allow_unverified: bool,
 }
 
+/// A phase of a source installation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallStage {
+    /// Downloading the official source archive.
+    Downloading,
+    /// Extracting and validating the source archive.
+    Extracting,
+    /// Compiling the source archive.
+    Building,
+    /// Writing and publishing the verified installation.
+    Finalizing,
+}
+
 /// Result of a committed installation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallResult {
@@ -202,12 +215,22 @@ impl Manager {
 
     /// Downloads, builds, verifies, and atomically publishes one Lua profile.
     pub fn install(&self, request: InstallRequest) -> Result<InstallResult> {
+        self.install_with_progress(request, |_| {})
+    }
+
+    /// Downloads, builds, verifies, and atomically publishes one Lua profile,
+    /// reporting each long-running phase before it starts.
+    pub fn install_with_progress(
+        &self,
+        request: InstallRequest,
+        progress: impl Fn(InstallStage),
+    ) -> Result<InstallResult> {
         let paths = self.root.paths();
         let _lock = acquire_lock(&paths)?;
         let operation = new_operation_id()?;
         let staging = paths.staging(&operation);
         fs::create_dir_all(&staging).map_err(|error| Error::Io(error.to_string()))?;
-        let result = self.install_staged(&paths, &staging, request);
+        let result = self.install_staged(&paths, &staging, request, &progress);
         if result.is_err() {
             let _ = fs::remove_dir_all(&staging);
         }
@@ -219,9 +242,11 @@ impl Manager {
         paths: &luavm_io::ManagerPaths,
         staging: &Path,
         request: InstallRequest,
+        progress: &dyn Fn(InstallStage),
     ) -> Result<InstallResult> {
         let archive = staging.join("source.tar.gz");
         let installer = Installer;
+        progress(InstallStage::Downloading);
         let downloaded = installer.download(
             &request.archive_url,
             &archive,
@@ -230,12 +255,15 @@ impl Manager {
             request.allow_unverified,
         )?;
         let extracted = staging.join("source");
+        progress(InstallStage::Extracting);
         installer.extract(&downloaded.path, &extracted)?;
         let source = source_root(&extracted)?;
         let profile = normalized_profile(request.profile, request.version);
         let profile_id = profile.id(request.version);
         let staged_install = staging.join("install");
+        progress(InstallStage::Building);
         installer.build(&source, &staged_install, request.version, &profile)?;
+        progress(InstallStage::Finalizing);
         let final_path = paths.installation(request.version, &profile_id);
         if final_path.exists() {
             return Err(Error::Conflict(format!(

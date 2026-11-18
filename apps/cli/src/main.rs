@@ -8,7 +8,7 @@ use std::path::Path;
 use std::process::{Command, ExitCode, Stdio};
 
 use luavm_core::{BuildProfile, LuaVersion, ProfileId};
-use luavm_engine::{InstallRequest, Manager, SelectionReport, help_text};
+use luavm_engine::{InstallRequest, InstallStage, Manager, SelectionReport, help_text};
 use luavm_io::{DataRoot, Installer, read_global_state};
 use luavm_util::{Error, Result};
 
@@ -320,12 +320,14 @@ fn path(manager: &Manager, args: &[String]) -> Result<()> {
 
 fn install(manager: &Manager, args: &[String]) -> Result<()> {
     let version = parse_version(args)?;
+    println!("Preparing to install Lua {version}...");
     ensure_prerequisites(args)?;
     let cflags = repeated_values(args, "--cflag")?;
     let ldflags = repeated_values(args, "--ldflag")?;
     let make_args = repeated_values(args, "--make-arg")?;
     let explicit_sha256 = option_value(args, "--sha256")?;
     let allow_unverified = args.iter().any(|value| value == "--allow-unverified");
+    println!("Checking the Lua release catalog...");
     let release = Installer.release(version)?;
     if let (Some(expected), Some(actual)) = (explicit_sha256.as_deref(), release.sha256.as_deref())
         && !expected.eq_ignore_ascii_case(actual)
@@ -353,12 +355,23 @@ fn install(manager: &Manager, args: &[String]) -> Result<()> {
         },
         allow_unverified,
     };
-    let result = manager.install(request)?;
+    let result = manager.install_with_progress(request, |stage| {
+        println!("{}", install_stage_message(stage));
+    })?;
     println!("Lua {} installed", result.version);
     println!("profile: {}", result.profile);
     println!("path: {}", result.path.display());
     println!("sha256: {}", result.sha256);
     Ok(())
+}
+
+fn install_stage_message(stage: InstallStage) -> &'static str {
+    match stage {
+        InstallStage::Downloading => "Downloading Lua source...",
+        InstallStage::Extracting => "Extracting and validating Lua source...",
+        InstallStage::Building => "Building Lua (this may take a few minutes)...",
+        InstallStage::Finalizing => "Finalizing the installation...",
+    }
 }
 
 fn ensure_prerequisites(args: &[String]) -> Result<()> {
@@ -693,5 +706,22 @@ fn json_string(value: Option<&str>) -> String {
     match value {
         Some(value) => format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"")),
         None => "null".to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn install_stage_messages_are_not_empty() {
+        for stage in [
+            InstallStage::Downloading,
+            InstallStage::Extracting,
+            InstallStage::Building,
+            InstallStage::Finalizing,
+        ] {
+            assert!(!install_stage_message(stage).is_empty());
+        }
     }
 }

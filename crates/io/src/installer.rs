@@ -307,12 +307,21 @@ impl Installer {
     ) -> Result<BuildOutcome> {
         validate_build_values(profile)?;
         fs::create_dir_all(install_root).map_err(io_error)?;
+        if cfg!(windows) {
+            // MinGW make compares target names case-insensitively, unlike the
+            // upstream Lua makefile's AIX/aix and FreeBSD/freebsd aliases.
+            prepare_windows_makefile(source)?;
+        }
         let (tool, target, _) = platform_build_tool();
         let mut command = Command::new(&tool);
         command.current_dir(source).arg(target);
         command.args(&profile.make_args);
-        command.arg("install");
-        command.arg(format!("INSTALL_TOP={}", make_tool_path(install_root)));
+        if !cfg!(windows) {
+            // Lua's install recipes use Unix mkdir/install commands, which
+            // are not available when mingw32-make falls back to cmd.exe.
+            command.arg("install");
+            command.arg(format!("INSTALL_TOP={}", make_tool_path(install_root)));
+        }
         if !profile.cflags.is_empty() {
             command.env("MYCFLAGS", profile.cflags.join(" "));
         }
@@ -328,6 +337,11 @@ impl Installer {
         })?;
         if !output.status.success() {
             return Err(Error::Process(command_failure_detail(&tool, &output)));
+        }
+        if cfg!(windows) {
+            // Install the MinGW outputs without invoking Lua's Unix-only
+            // install recipe.
+            install_windows_artifacts(source, install_root, version)?;
         }
         verify_installation(install_root, version)?;
         Ok(BuildOutcome {
@@ -495,6 +509,49 @@ fn platform_build_tool() -> (String, &'static str, &'static str) {
 fn make_tool_path(path: &Path) -> String {
     let value = path.to_string_lossy().into_owned();
     if cfg!(windows) { value.replace('\\', "/") } else { value }
+}
+
+fn prepare_windows_makefile(source: &Path) -> Result<()> {
+    let makefile = source.join("src").join("Makefile");
+    let contents = fs::read_to_string(&makefile).map_err(io_error)?;
+    let normalized = normalize_windows_makefile(&contents);
+    if normalized != contents {
+        fs::write(makefile, normalized).map_err(io_error)?;
+    }
+    Ok(())
+}
+
+fn normalize_windows_makefile(contents: &str) -> String {
+    contents
+        .replace("AIX aix:", "aix:")
+        .replace("FreeBSD NetBSD OpenBSD freebsd:", "NetBSD OpenBSD freebsd:")
+}
+
+fn install_windows_artifacts(source: &Path, install_root: &Path, version: LuaVersion) -> Result<()> {
+    let source = source.join("src");
+    let bin = install_root.join("bin");
+    let include = install_root.join("include");
+    let lib = install_root.join("lib");
+    for directory in [&bin, &include, &lib] {
+        fs::create_dir_all(directory).map_err(io_error)?;
+    }
+    for name in ["lua.exe", "luac.exe"] {
+        copy_required_file(&source.join(name), &bin.join(name))?;
+    }
+    let dll_name = format!("lua{}{}.dll", version.major, version.minor);
+    copy_required_file(&source.join(&dll_name), &bin.join(&dll_name))?;
+    for name in ["lua.h", "luaconf.h", "lualib.h", "lauxlib.h", "lua.hpp"] {
+        copy_required_file(&source.join(name), &include.join(name))?;
+    }
+    copy_required_file(&source.join("liblua.a"), &lib.join("liblua.a"))
+}
+
+fn copy_required_file(source: &Path, destination: &Path) -> Result<()> {
+    if !source.is_file() {
+        return Err(Error::Process(format!("built file is missing: {}", source.display())));
+    }
+    fs::copy(source, destination).map_err(io_error)?;
+    Ok(())
 }
 
 fn command_available(command_name: &str) -> bool {
@@ -848,6 +905,17 @@ mod tests {
         } else {
             assert_eq!(formatted, "/tmp/luavm/install");
         }
+    }
+
+    #[test]
+    fn removes_case_colliding_lua_make_aliases_for_windows_make() {
+        let makefile = "AIX aix:\n\t$(MAKE) all\nFreeBSD NetBSD OpenBSD freebsd:\n\t$(MAKE) all\n";
+        let normalized = normalize_windows_makefile(makefile);
+        assert_eq!(
+            normalized,
+            "aix:\n\t$(MAKE) all\nNetBSD OpenBSD freebsd:\n\t$(MAKE) all\n"
+        );
+        assert_eq!(normalize_windows_makefile(&normalized), normalized);
     }
 
     #[test]
