@@ -32,18 +32,18 @@ pub struct Manager {
     root: DataRoot,
 }
 
-/// Inputs for an official Lua source installation.
+/// Inputs for an Lua source installation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallRequest {
     /// Lua version to build.
     pub version: LuaVersion,
-    /// Official HTTPS archive URL.
+    /// HTTPS archive URL.
     pub archive_url: String,
-    /// Official SHA-256, when published.
+    /// SHA-256, when published.
     pub official_sha256: Option<String>,
     /// Build settings used to create the isolated profile.
     pub profile: BuildProfile,
-    /// Explicit confirmation when no official checksum exists.
+    /// Explicit confirmation when no checksum exists.
     pub allow_unverified: bool,
 }
 
@@ -130,13 +130,38 @@ impl Manager {
     /// Writes a project-local selection in the current directory.
     pub fn set_local(&self, cwd: &Path, version: LuaVersion, profile: Option<ProfileId>) -> Result<PathBuf> {
         let path = cwd.join(".luavm.toml");
+        if let Ok(metadata) = fs::symlink_metadata(&path) {
+            if metadata.file_type().is_symlink() {
+                return Err(Error::Conflict(
+                    "refusing to overwrite a symbolic project config".to_owned(),
+                ));
+            }
+            if !metadata.is_file() {
+                return Err(Error::InvalidInput(
+                    "project config path is not a regular file".to_owned(),
+                ));
+            }
+        }
         let build = BuildProfile::default();
         let config = ProjectConfig {
             lua: Some(version),
             profile,
             build,
         };
-        fs::write(&path, config.to_toml()?).map_err(|error| Error::Io(error.to_string()))?;
+        let temporary = path.with_extension("toml.tmp");
+        if let Err(error) = fs::write(&temporary, config.to_toml()?) {
+            let _ = fs::remove_file(&temporary);
+            return Err(Error::Io(error.to_string()));
+        }
+        let replace_result = if cfg!(windows) && path.exists() {
+            fs::remove_file(&path).and_then(|()| fs::rename(&temporary, &path))
+        } else {
+            fs::rename(&temporary, &path)
+        };
+        if let Err(error) = replace_result {
+            let _ = fs::remove_file(&temporary);
+            return Err(Error::Io(error.to_string()));
+        }
         Ok(path)
     }
 
@@ -200,6 +225,7 @@ impl Manager {
         let downloaded = installer.download(
             &request.archive_url,
             &archive,
+            request.version,
             request.official_sha256.as_deref(),
             request.allow_unverified,
         )?;
@@ -218,16 +244,16 @@ impl Manager {
             )));
         }
         let metadata = format!(
-            "version={}\nprofile={}\nsha256={}\nofficial_checksum_verified={}\ntarget={}\ncompiler={}\ncflags={}\nldflags={}\nmake_args={}\n",
-            request.version,
-            profile_id,
-            downloaded.sha256,
+            "{{\"schema\":1,\"version\":{},\"profile\":{},\"sha256\":{},\"official_checksum_verified\":{},\"target\":{},\"compiler\":{},\"cflags\":{},\"ldflags\":{},\"make_args\":{}}}\n",
+            json_string(&request.version.to_string()),
+            json_string(profile_id.as_str()),
+            json_string(&downloaded.sha256),
             downloaded.official_checksum_verified,
-            profile.target,
-            profile.compiler,
-            profile.cflags.join("\t"),
-            profile.ldflags.join("\t"),
-            profile.make_args.join("\t"),
+            json_string(&profile.target),
+            json_string(&profile.compiler),
+            json_array(&profile.cflags),
+            json_array(&profile.ldflags),
+            json_array(&profile.make_args),
         );
         fs::write(staged_install.join("metadata.json"), metadata).map_err(|error| Error::Io(error.to_string()))?;
         let parent = final_path
@@ -286,11 +312,27 @@ fn source_root(extracted: &Path) -> Result<PathBuf> {
     ))
 }
 
+fn json_string(value: &str) -> String {
+    let escaped = value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\r', "\\r")
+        .replace('\n', "\\n")
+        .replace('\t', "\\t");
+    format!("\"{escaped}\"")
+}
+
+fn json_array(values: &[String]) -> String {
+    let values = values.iter().map(|value| json_string(value)).collect::<Vec<_>>();
+    format!("[{}]", values.join(","))
+}
+
 /// Returns the command names exposed by the CLI.
 pub fn command_names() -> &'static [&'static str] {
     &[
         "help",
         "version",
+        "doctor",
         "install",
         "uninstall",
         "list",
@@ -309,7 +351,7 @@ pub fn command_names() -> &'static [&'static str] {
 
 /// Returns a concise command overview.
 pub fn help_text() -> &'static str {
-    "LuaVM is a lightweight Lua version manager.\n\nUsage: luavm <command> [options]\n\nCommands:\n  install <version> [--sha256 <digest>] [--allow-unverified]\n  uninstall <version> [--profile <id>] [--yes] [--force]\n  list [--available] [--json]\n  use <version>\n  global <version>|--unset\n  local <version>|--unset\n  detect [--json]\n  current [--json]\n  env [--project] [--shell <shell>]\n  exec [<version>] [--project] -- <command> [args...]\n  path <version>\n  shell-init <shell>\n  completions <shell>\n  version\n  help\n"
+    "LuaVM is a lightweight Lua version manager.\n\nUsage: luavm <command> [options]\n\nCommands:\n  install <version> [--sha256 <digest>] [--allow-unverified] [--no-prerequisites]\n  uninstall <version> [--profile <id>] [--yes] [--force]\n  list [--available] [--json]\n  use <version>\n  global <version>|--unset\n  local <version>|--unset\n  detect [--json]\n  current [--json]\n  doctor [--json] [--fix]\n  env [--project] [--shell <shell>]\n  exec [<version>] [--project] -- <command> [args...]\n  path <version>\n  shell-init <shell>\n  completions <shell>\n  version\n  help\n"
 }
 
 #[cfg(test)]

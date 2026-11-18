@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use luavm_util::{Error, Result};
 
-/// A normalized official Lua release version.
+/// A normalized Lua release version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LuaVersion {
     /// Major release component.
@@ -253,12 +253,34 @@ fn parse_string(value: &str) -> Result<String> {
     let inner = value
         .get(1..value.len().saturating_sub(1))
         .ok_or_else(|| Error::InvalidInput("invalid quoted string".to_owned()))?;
-    if inner.chars().any(|ch| matches!(ch, '\r' | '\n' | '\\')) {
-        return Err(Error::InvalidInput(
-            "escaped strings are not supported in project config".to_owned(),
-        ));
+    let mut output = String::with_capacity(inner.len());
+    let mut escaped = false;
+    for character in inner.chars() {
+        if escaped {
+            let value = match character {
+                '"' => '"',
+                '\\' => '\\',
+                'n' => '\n',
+                'r' => '\r',
+                't' => '\t',
+                _ => return Err(Error::InvalidInput("unsupported string escape".to_owned())),
+            };
+            output.push(value);
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else if matches!(character, '\r' | '\n' | '\0') {
+            return Err(Error::InvalidInput(
+                "quoted strings cannot contain raw control characters".to_owned(),
+            ));
+        } else {
+            output.push(character);
+        }
     }
-    Ok(inner.to_owned())
+    if escaped {
+        return Err(Error::InvalidInput("quoted string ends with an escape".to_owned()));
+    }
+    Ok(output)
 }
 
 fn parse_array(value: &str) -> Result<Vec<String>> {
@@ -272,22 +294,54 @@ fn parse_array(value: &str) -> Result<Vec<String>> {
     if inner.trim().is_empty() {
         return Ok(Vec::new());
     }
-    inner.split(',').map(parse_string).collect()
+    let mut segments = Vec::new();
+    let mut start = 0_usize;
+    let mut quoted = false;
+    let mut escaped = false;
+    for (position, character) in inner.char_indices() {
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                quoted = false;
+            }
+        } else if character == '"' {
+            quoted = true;
+        } else if character == ',' {
+            segments.push(inner.get(start..position).unwrap_or_default().trim());
+            start = position.saturating_add(character.len_utf8());
+        }
+    }
+    if quoted || escaped {
+        return Err(Error::InvalidInput("unterminated string in array".to_owned()));
+    }
+    segments.push(inner.get(start..).unwrap_or_default().trim());
+    segments
+        .into_iter()
+        .map(|segment| {
+            if segment.is_empty() {
+                return Err(Error::InvalidInput("array contains an empty item".to_owned()));
+            }
+            parse_string(segment)
+        })
+        .collect()
 }
 
 fn format_array(values: &[String]) -> Result<String> {
     let mut output = String::from("[");
     for (index, value) in values.iter().enumerate() {
-        if value.chars().any(|ch| matches!(ch, '"' | '\\' | '\r' | '\n')) {
+        if value.chars().any(|ch| matches!(ch, '\r' | '\n' | '\0')) {
             return Err(Error::InvalidInput(
-                "build flags cannot contain quotes, slashes, or newlines".to_owned(),
+                "build flags cannot contain raw control characters".to_owned(),
             ));
         }
         if index > 0 {
             output.push_str(", ");
         }
         output.push('"');
-        output.push_str(value);
+        output.push_str(&value.replace('\\', "\\\\").replace('"', "\\\""));
         output.push('"');
     }
     output.push(']');
@@ -385,11 +439,31 @@ mod tests {
 
     #[test]
     fn project_config_parses_build_flags() {
-        let config = ProjectConfig::parse("lua = \"5.4.8\"\n[build]\ncflags = [\"-O2\", \"-g\"]\n");
-        assert_eq!(config.as_ref().map(|value| value.build.cflags.len()), Ok(2));
+        let config = ProjectConfig::parse(
+            "lua = \"5.4.8\"\n[build]\ncflags = [\"-O2\", \"-IC:\\\\Lua\\\\include\", \"-DVALUE=1,2\"]\n",
+        );
+        assert_eq!(config.as_ref().map(|value| value.build.cflags.len()), Ok(3));
         assert_eq!(
             config.ok().and_then(|value| value.lua).map(|value| value.to_string()),
             Some("5.4.8".to_owned())
+        );
+    }
+
+    #[test]
+    fn project_config_round_trips_escaped_flags() {
+        let config = ProjectConfig {
+            lua: LuaVersion::parse("5.4.8").ok(),
+            build: BuildProfile {
+                cflags: vec!["-I/usr/local/include".to_owned(), "-DNAME=\"lua\"".to_owned()],
+                ..BuildProfile::default()
+            },
+            ..ProjectConfig::default()
+        };
+        let serialized = config.to_toml();
+        assert!(serialized.is_ok());
+        assert_eq!(
+            serialized.ok().and_then(|value| ProjectConfig::parse(&value).ok()),
+            Some(config)
         );
     }
 

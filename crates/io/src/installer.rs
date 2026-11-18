@@ -1,18 +1,46 @@
 #![forbid(unsafe_code)]
 #![doc = "Download, digest, extraction, and platform build adapters."]
 
-use std::collections::BTreeSet;
 use std::fmt::Write as FmtWrite;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use luavm_core::{BuildProfile, LuaVersion};
 use luavm_util::{Error, Result};
 
 const MAX_ARCHIVE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_LISTING_BYTES: usize = 2 * 1024 * 1024;
+const MAX_ARCHIVE_ENTRIES: usize = 100_000;
+const MAX_EXPANDED_BYTES: u64 = 512 * 1024 * 1024;
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(300);
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(900);
+const BUILD_TIMEOUT: Duration = Duration::from_secs(900);
+
+/// One release record from the Lua archive index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OfficialRelease {
+    /// Lua version.
+    pub version: LuaVersion,
+    /// source archive URL.
+    pub archive_url: String,
+    /// SHA-256 checksum, when published.
+    pub sha256: Option<String>,
+}
+
+/// A host prerequisite needed for compiling official Lua sources.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrerequisiteStatus {
+    /// Human-readable prerequisite name.
+    pub name: String,
+    /// Whether the executable was found and responded successfully.
+    pub available: bool,
+    /// Platform-specific installation guidance.
+    pub hint: String,
+}
 
 /// A verified or locally computed archive digest.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,7 +49,7 @@ pub struct DownloadedArchive {
     pub path: PathBuf,
     /// Lowercase SHA-256 digest.
     pub sha256: String,
-    /// Whether an official checksum matched.
+    /// Whether an checksum matched.
     pub official_checksum_verified: bool,
 }
 
@@ -39,90 +67,146 @@ pub struct BuildOutcome {
 pub struct Installer;
 
 impl Installer {
-    /// Fetches and parses the official Lua release index.
-    pub fn available_versions(&self) -> Result<Vec<LuaVersion>> {
-        let output = Command::new("curl")
-            .args([
-                "--fail",
-                "--silent",
-                "--show-error",
-                "--location",
-                "--proto",
-                "=https",
-                "--max-redirs",
-                "3",
-                "--max-filesize",
-                "2097152",
-                "https://www.lua.org/ftp/",
-            ])
-            .output()
-            .map_err(|error| Error::NotFound(format!("curl is required for release discovery: {error}")))?;
-        if !output.status.success() {
-            return Err(Error::Process(
-                "unable to fetch the official Lua release index".to_owned(),
-            ));
-        }
-        let html = String::from_utf8(output.stdout)
-            .map_err(|_| Error::InvalidInput("official release index is not UTF-8".to_owned()))?;
-        let mut versions = BTreeSet::new();
-        for token in
-            html.split(|character: char| !character.is_ascii_alphanumeric() && character != '.' && character != '-')
-        {
-            let Some(version_text) = token.strip_prefix("lua-") else {
-                continue;
-            };
-            let Some(version_text) = version_text.strip_suffix(".tar.gz") else {
-                continue;
-            };
-            if let Ok(version) = LuaVersion::parse(version_text) {
-                versions.insert(version);
-            }
-        }
-        Ok(versions.into_iter().collect())
+    /// Checks the host tools required for a source build.
+    pub fn prerequisites(&self) -> Vec<PrerequisiteStatus> {
+        let (build_tool, _, build_hint) = platform_build_tool();
+        let build_available = command_available(&build_tool);
+        let (compiler_name, compiler_available, compiler_hint) = if cfg!(windows) {
+            (
+                "C compiler (gcc or clang)".to_owned(),
+                command_available("gcc") || command_available("clang"),
+                "Install MinGW-w64 or LLVM and add it to PATH".to_owned(),
+            )
+        } else {
+            (
+                "C compiler (cc)".to_owned(),
+                command_available("cc"),
+                "Install the platform C compiler toolchain".to_owned(),
+            )
+        };
+        vec![
+            PrerequisiteStatus {
+                name: build_tool,
+                available: build_available,
+                hint: build_hint.to_owned(),
+            },
+            PrerequisiteStatus {
+                name: compiler_name,
+                available: compiler_available,
+                hint: compiler_hint,
+            },
+        ]
     }
 
+    /// Fetches and parses the Lua release index.
+    pub fn available_releases(&self) -> Result<Vec<OfficialRelease>> {
+        let mut command = Command::new("curl");
+        command.args([
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--location",
+            "--proto",
+            "=https",
+            "--max-redirs",
+            "0",
+            "--connect-timeout",
+            "15",
+            "--max-time",
+            "60",
+            "--max-filesize",
+            "2097152",
+            "https://www.lua.org/ftp/",
+        ]);
+        let output = run_command(&mut command, COMMAND_TIMEOUT, MAX_LISTING_BYTES).map_err(|error| match error {
+            Error::NotFound(detail) => Error::NotFound(format!("curl is required for release discovery: {detail}")),
+            other => other,
+        })?;
+        if output.truncated {
+            return Err(Error::InvalidInput("release index exceeds the size limit".to_owned()));
+        }
+        if !output.status.success() {
+            return Err(Error::Process(command_failure_detail("curl", &output)));
+        }
+        let html = String::from_utf8(output.stdout)
+            .map_err(|_| Error::InvalidInput("release index is not UTF-8".to_owned()))?;
+        parse_release_index(&html)
+    }
+
+    /// Fetches the record for one Lua version.
+    pub fn release(&self, version: LuaVersion) -> Result<OfficialRelease> {
+        self.available_releases()?
+            .into_iter()
+            .find(|release| release.version == version)
+            .ok_or_else(|| Error::NotFound(format!("Lua release {version} was not found")))
+    }
+
+    /// Fetches and parses only the Lua release versions.
+    pub fn available_versions(&self) -> Result<Vec<LuaVersion>> {
+        Ok(self
+            .available_releases()?
+            .into_iter()
+            .map(|release| release.version)
+            .collect())
+    }
+
+    /*
+     * Keep the public release catalog separate from the download operation so
+     * callers can display or test metadata without downloading bytes.
+     */
     /// Downloads an HTTPS archive to a temporary path and verifies its digest.
     pub fn download(
         &self,
         url: &str,
         destination: &Path,
+        expected_version: LuaVersion,
         official_sha256: Option<&str>,
         allow_unverified: bool,
     ) -> Result<DownloadedArchive> {
-        validate_https_url(url)?;
+        let archive_version = validate_https_url(url)?;
+        if archive_version != expected_version {
+            return Err(Error::InvalidInput(format!(
+                "archive URL version {archive_version} does not match requested Lua {expected_version}"
+            )));
+        }
         let parent = destination
             .parent()
             .ok_or_else(|| Error::InvalidInput("archive destination has no parent".to_owned()))?;
         fs::create_dir_all(parent).map_err(io_error)?;
         let max_bytes = MAX_ARCHIVE_BYTES.to_string();
         let destination_text = destination.to_string_lossy().into_owned();
-        let output = Command::new("curl")
-            .args([
-                "--fail",
-                "--silent",
-                "--show-error",
-                "--location",
-                "--proto",
-                "=https",
-                "--tlsv1.2",
-                "--max-redirs",
-                "3",
-                "--max-filesize",
-                max_bytes.as_str(),
-                "--output",
-                destination_text.as_str(),
-                url,
-            ])
-            .output()
-            .map_err(|error| Error::NotFound(format!("curl is required for downloads: {error}")))?;
+        let mut command = Command::new("curl");
+        command.args([
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--location",
+            "--proto",
+            "=https",
+            "--tlsv1.2",
+            "--max-redirs",
+            "0",
+            "--connect-timeout",
+            "15",
+            "--max-time",
+            "900",
+            "--retry",
+            "2",
+            "--retry-delay",
+            "1",
+            "--max-filesize",
+            max_bytes.as_str(),
+            "--output",
+            destination_text.as_str(),
+            url,
+        ]);
+        let output = run_command(&mut command, DOWNLOAD_TIMEOUT, 64 * 1024).map_err(|error| match error {
+            Error::NotFound(detail) => Error::NotFound(format!("curl is required for downloads: {detail}")),
+            other => other,
+        })?;
         if !output.status.success() {
-            let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
             let _ = fs::remove_file(destination);
-            return Err(Error::Process(if detail.is_empty() {
-                format!("curl exited with {}", output.status)
-            } else {
-                detail
-            }));
+            return Err(Error::Process(command_failure_detail("curl", &output)));
         }
         let size = fs::metadata(destination).map_err(io_error)?.len();
         if size > MAX_ARCHIVE_BYTES {
@@ -136,14 +220,14 @@ impl Installer {
             Some(expected) => {
                 if !is_sha256(expected) || !constant_time_equal(&sha256, &expected.to_ascii_lowercase()) {
                     let _ = fs::remove_file(destination);
-                    return Err(Error::Conflict("official SHA-256 checksum mismatch".to_owned()));
+                    return Err(Error::Conflict("SHA-256 checksum mismatch".to_owned()));
                 }
                 true
             },
             None if !allow_unverified => {
                 let _ = fs::remove_file(destination);
                 return Err(Error::Conflict(
-                    "no official checksum is available; pass explicit unverified confirmation".to_owned(),
+                    "no checksum is available; pass explicit unverified confirmation".to_owned(),
                 ));
             },
             None => false,
@@ -157,26 +241,41 @@ impl Installer {
 
     /// Validates an archive listing and extracts it into an empty directory.
     pub fn extract(&self, archive: &Path, destination: &Path) -> Result<()> {
-        fs::create_dir_all(destination).map_err(io_error)?;
+        if destination.exists() {
+            if !destination.is_dir() {
+                return Err(Error::InvalidInput("archive destination is not a directory".to_owned()));
+            }
+            let mut entries = fs::read_dir(destination).map_err(io_error)?;
+            if entries.next().transpose().map_err(io_error)?.is_some() {
+                return Err(Error::Conflict("archive destination must be empty".to_owned()));
+            }
+        } else {
+            fs::create_dir_all(destination).map_err(io_error)?;
+        }
         let archive_text = archive.to_string_lossy().into_owned();
         let destination_text = destination.to_string_lossy().into_owned();
-        let listing = Command::new("tar")
-            .args(["-tzf", archive_text.as_str()])
-            .output()
-            .map_err(|error| Error::NotFound(format!("tar is required for extraction: {error}")))?;
+        let mut listing_command = Command::new("tar");
+        listing_command.args(["-tzf", archive_text.as_str()]);
+        let listing = run_command(&mut listing_command, COMMAND_TIMEOUT, MAX_LISTING_BYTES)
+            .map_err(|error| command_error("tar", "examine source archive", error))?;
+        if listing.truncated {
+            return Err(Error::InvalidInput("archive listing exceeds the size limit".to_owned()));
+        }
         if !listing.status.success() {
             return Err(Error::Process("unable to inspect source archive".to_owned()));
-        }
-        if listing.stdout.len() > MAX_LISTING_BYTES {
-            return Err(Error::InvalidInput("archive listing exceeds the size limit".to_owned()));
         }
         for raw_name in String::from_utf8_lossy(&listing.stdout).lines() {
             validate_archive_path(raw_name)?;
         }
-        let details = Command::new("tar")
-            .args(["-tvzf", archive_text.as_str()])
-            .output()
-            .map_err(|error| Error::Process(error.to_string()))?;
+        let mut details_command = Command::new("tar");
+        details_command.args(["-tvzf", archive_text.as_str()]);
+        let details = run_command(&mut details_command, COMMAND_TIMEOUT, MAX_LISTING_BYTES)
+            .map_err(|error| command_error("tar", "inspect archive entry types", error))?;
+        if details.truncated {
+            return Err(Error::InvalidInput(
+                "archive detail listing exceeds the size limit".to_owned(),
+            ));
+        }
         if !details.status.success() {
             return Err(Error::Process("unable to inspect archive entry types".to_owned()));
         }
@@ -187,19 +286,12 @@ impl Installer {
                 ));
             }
         }
-        let extracted = Command::new("tar")
-            .args(["-xzf", archive_text.as_str(), "-C", destination_text.as_str()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .output()
-            .map_err(|error| Error::Process(error.to_string()))?;
+        let mut extract_command = Command::new("tar");
+        extract_command.args(["-xzf", archive_text.as_str(), "-C", destination_text.as_str()]);
+        let extracted = run_command(&mut extract_command, COMMAND_TIMEOUT, 64 * 1024)
+            .map_err(|error| command_error("tar", "extract source archive", error))?;
         if !extracted.status.success() {
-            let detail = String::from_utf8_lossy(&extracted.stderr).trim().to_owned();
-            return Err(Error::Process(if detail.is_empty() {
-                "tar failed to extract the archive".to_owned()
-            } else {
-                detail
-            }));
+            return Err(Error::Process(command_failure_detail("tar", &extracted)));
         }
         validate_extracted_tree(destination)?;
         Ok(())
@@ -215,7 +307,7 @@ impl Installer {
     ) -> Result<BuildOutcome> {
         validate_build_values(profile)?;
         fs::create_dir_all(install_root).map_err(io_error)?;
-        let (tool, target) = platform_build_tool();
+        let (tool, target, _) = platform_build_tool();
         let mut command = Command::new(&tool);
         command.current_dir(source).arg(target);
         command.args(&profile.make_args);
@@ -227,18 +319,17 @@ impl Installer {
         if !profile.ldflags.is_empty() {
             command.env("MYLDFLAGS", profile.ldflags.join(" "));
         }
-        let output = command
-            .output()
-            .map_err(|error| Error::NotFound(format!("build tool `{tool}` is required for Lua {version}: {error}")))?;
+        let output = run_command(&mut command, BUILD_TIMEOUT, 256 * 1024).map_err(|error| match error {
+            Error::NotFound(detail) => {
+                Error::NotFound(format!("build tool `{tool}` is required for Lua {version}: {detail}"))
+            },
+            Error::Process(detail) => Error::Process(format!("{tool} failed for Lua {version}: {detail}")),
+            other => other,
+        })?;
         if !output.status.success() {
-            let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-            return Err(Error::Process(if detail.is_empty() {
-                format!("{tool} failed with {}", output.status)
-            } else {
-                detail
-            }));
+            return Err(Error::Process(command_failure_detail(&tool, &output)));
         }
-        verify_installation(install_root)?;
+        verify_installation(install_root, version)?;
         Ok(BuildOutcome {
             install_root: install_root.to_path_buf(),
             build_tool: tool,
@@ -246,14 +337,167 @@ impl Installer {
     }
 }
 
-fn platform_build_tool() -> (String, &'static str) {
-    if cfg!(windows) {
-        ("mingw32-make".to_owned(), "mingw")
-    } else if cfg!(target_os = "macos") {
-        ("make".to_owned(), "macosx")
-    } else {
-        ("make".to_owned(), "posix")
+fn parse_release_index(html: &str) -> Result<Vec<OfficialRelease>> {
+    let tokens = html
+        .split(|character: char| !character.is_ascii_alphanumeric() && character != '.' && character != '-')
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    let mut releases = Vec::new();
+    for (index, token) in tokens.iter().enumerate() {
+        let Some(version_text) = token.strip_prefix("lua-") else {
+            continue;
+        };
+        let Some(version_text) = version_text.strip_suffix(".tar.gz") else {
+            continue;
+        };
+        let Ok(version) = LuaVersion::parse(version_text) else {
+            continue;
+        };
+        let mut checksum = None;
+        for candidate in tokens.iter().skip(index.saturating_add(1)).take(32) {
+            if candidate != token && candidate.starts_with("lua-") && candidate.ends_with(".tar.gz") {
+                break;
+            }
+            if is_sha256(candidate) {
+                checksum = Some((*candidate).to_ascii_lowercase());
+                break;
+            }
+        }
+        releases.push(OfficialRelease {
+            version,
+            archive_url: format!("https://www.lua.org/ftp/{token}"),
+            sha256: checksum,
+        });
     }
+    releases.sort_by_key(|release| release.version);
+    releases.dedup_by(|left, right| left.version == right.version);
+    if releases.is_empty() {
+        return Err(Error::InvalidInput("release index contains no Lua archives".to_owned()));
+    }
+    Ok(releases)
+}
+
+fn run_command(command: &mut Command, timeout: Duration, max_output: usize) -> Result<CapturedOutput> {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| Error::NotFound(error.to_string()))?;
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        return Err(Error::Process("command stdout was not available".to_owned()));
+    };
+    let Some(stderr) = child.stderr.take() else {
+        let _ = child.kill();
+        return Err(Error::Process("command stderr was not available".to_owned()));
+    };
+    let stdout_reader = thread::spawn(move || read_bounded(stdout, max_output));
+    let stderr_reader = thread::spawn(move || read_bounded(stderr, max_output));
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait().map_err(io_error)? {
+            Some(status) => break status,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(Error::Process(format!(
+                    "command timed out after {} seconds",
+                    timeout.as_secs()
+                )));
+            },
+            None => thread::sleep(Duration::from_millis(25)),
+        }
+    };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| Error::Process("stdout reader failed".to_owned()))?
+        .map_err(io_error)?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| Error::Process("stderr reader failed".to_owned()))?
+        .map_err(io_error)?;
+    Ok(CapturedOutput {
+        status,
+        stdout: stdout.bytes,
+        stderr: stderr.bytes,
+        truncated: stdout.truncated || stderr.truncated,
+    })
+}
+
+fn read_bounded<R: Read>(mut reader: R, max_output: usize) -> std::io::Result<BoundedOutput> {
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    let mut truncated = false;
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        let remaining = max_output.saturating_sub(bytes.len());
+        let stored = count.min(remaining);
+        let chunk = buffer
+            .get(..stored)
+            .ok_or_else(|| std::io::Error::other("bounded command output range failed"))?;
+        bytes.extend_from_slice(chunk);
+        if stored < count {
+            truncated = true;
+        }
+    }
+    Ok(BoundedOutput { bytes, truncated })
+}
+
+#[derive(Debug)]
+struct BoundedOutput {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+#[derive(Debug)]
+struct CapturedOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    truncated: bool,
+}
+
+fn command_error(tool: &str, operation: &str, error: Error) -> Error {
+    match error {
+        Error::NotFound(detail) => Error::NotFound(format!("{tool} is required to {operation}: {detail}")),
+        other => other,
+    }
+}
+
+fn command_failure_detail(tool: &str, output: &CapturedOutput) -> String {
+    let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    if detail.is_empty() {
+        format!("{tool} exited with {}", output.status)
+    } else {
+        detail
+    }
+}
+
+fn platform_build_tool() -> (String, &'static str, &'static str) {
+    if cfg!(windows) {
+        (
+            "mingw32-make".to_owned(),
+            "mingw",
+            "Install MinGW-w64 and add mingw32-make to PATH",
+        )
+    } else if cfg!(target_os = "macos") {
+        ("make".to_owned(), "macosx", "Install Xcode Command Line Tools")
+    } else {
+        ("make".to_owned(), "posix", "Install the system make package")
+    }
+}
+
+fn command_available(command_name: &str) -> bool {
+    let mut command = Command::new(command_name);
+    command.arg("--version");
+    run_command(&mut command, Duration::from_secs(10), 4096)
+        .map(|output| output.status.success())
+        .unwrap_or(false)
 }
 
 fn validate_build_values(profile: &BuildProfile) -> Result<()> {
@@ -263,34 +507,51 @@ fn validate_build_values(profile: &BuildProfile) -> Result<()> {
         .chain(profile.ldflags.iter())
         .chain(profile.make_args.iter())
     {
-        if value
-            .chars()
-            .any(|character| matches!(character, '\0' | '\r' | '\n' | '\t'))
-        {
+        if value.chars().any(|character| {
+            matches!(
+                character,
+                '\0' | '\r' | '\n' | '\t' | ';' | '&' | '|' | '$' | '`' | '<' | '>' | '"' | '\'' | '%' | '^'
+            )
+        }) {
             return Err(Error::InvalidInput(
-                "build flags cannot contain NULs, tabs, or newlines".to_owned(),
+                "build values cannot contain control characters or shell metacharacters".to_owned(),
             ));
         }
     }
     Ok(())
 }
 
-fn validate_https_url(url: &str) -> Result<()> {
-    if !url.starts_with("https://") || url.chars().any(|ch| matches!(ch, '\r' | '\n' | '"' | '\'')) {
+fn validate_https_url(url: &str) -> Result<LuaVersion> {
+    let Some(name) = url.strip_prefix("https://www.lua.org/ftp/") else {
+        return Err(Error::InvalidInput(
+            "only official Lua HTTPS archive URLs are allowed".to_owned(),
+        ));
+    };
+    let Some(version_text) = name
+        .strip_prefix("lua-")
+        .and_then(|value| value.strip_suffix(".tar.gz"))
+    else {
+        return Err(Error::InvalidInput(
+            "only official Lua source archives are allowed".to_owned(),
+        ));
+    };
+    let version = LuaVersion::parse(version_text);
+    if version.is_err() || url.chars().any(|ch| matches!(ch, '\r' | '\n' | '"' | '\'' | '?' | '#')) {
         return Err(Error::InvalidInput("only clean HTTPS URLs are allowed".to_owned()));
     }
-    Ok(())
+    version
 }
 
 fn validate_archive_path(name: &str) -> Result<()> {
-    let path = Path::new(name);
-    if path.is_absolute() || name.starts_with('\\') || name.contains(':') {
+    let normalized = name.replace('\\', "/");
+    let path = Path::new(&normalized);
+    if path.is_absolute() || normalized.starts_with('/') || normalized.contains(':') {
         return Err(Error::InvalidInput(format!(
             "archive contains an absolute path: {name}"
         )));
     }
-    for component in path.components() {
-        if matches!(component, std::path::Component::ParentDir) {
+    for component in normalized.split('/') {
+        if component == ".." {
             return Err(Error::InvalidInput(format!("archive contains traversal: {name}")));
         }
     }
@@ -300,7 +561,15 @@ fn validate_archive_path(name: &str) -> Result<()> {
 fn validate_extracted_tree(root: &Path) -> Result<()> {
     let canonical_root = root.canonicalize().map_err(io_error)?;
     let mut pending = vec![root.to_path_buf()];
+    let mut entries = 0_usize;
+    let mut expanded_bytes = 0_u64;
     while let Some(path) = pending.pop() {
+        entries = entries
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidInput("archive entry count overflowed".to_owned()))?;
+        if entries > MAX_ARCHIVE_ENTRIES {
+            return Err(Error::InvalidInput("archive contains too many entries".to_owned()));
+        }
         let metadata = fs::symlink_metadata(&path).map_err(io_error)?;
         if metadata.file_type().is_symlink() {
             let target = fs::read_link(&path).map_err(io_error)?;
@@ -319,12 +588,25 @@ fn validate_extracted_tree(root: &Path) -> Result<()> {
             for entry in fs::read_dir(&path).map_err(io_error)? {
                 pending.push(entry.map_err(io_error)?.path());
             }
+        } else if metadata.is_file() {
+            expanded_bytes = expanded_bytes
+                .checked_add(metadata.len())
+                .ok_or_else(|| Error::InvalidInput("expanded archive size overflowed".to_owned()))?;
+            if expanded_bytes > MAX_EXPANDED_BYTES {
+                return Err(Error::InvalidInput(
+                    "expanded archive exceeds the size limit".to_owned(),
+                ));
+            }
+        } else {
+            return Err(Error::InvalidInput(
+                "archive contains an unsupported file type".to_owned(),
+            ));
         }
     }
     Ok(())
 }
 
-fn verify_installation(root: &Path) -> Result<()> {
+fn verify_installation(root: &Path, version: LuaVersion) -> Result<()> {
     let binary = if cfg!(windows) {
         root.join("bin/lua.exe")
     } else {
@@ -334,6 +616,21 @@ fn verify_installation(root: &Path) -> Result<()> {
         return Err(Error::Process(format!(
             "built Lua binary is missing: {}",
             binary.display()
+        )));
+    }
+    let binary = binary.canonicalize().map_err(io_error)?;
+    let mut command = Command::new(binary);
+    command.arg("-v");
+    let output = run_command(&mut command, COMMAND_TIMEOUT, 64 * 1024)?;
+    if !output.status.success() {
+        return Err(Error::Process(format!("built Lua {version} failed its version check")));
+    }
+    let mut reported = String::from_utf8_lossy(&output.stdout).into_owned();
+    reported.push_str(&String::from_utf8_lossy(&output.stderr));
+    if !reported.contains(&format!("Lua {version}")) {
+        return Err(Error::Conflict(format!(
+            "built binary reported an unexpected Lua version: {}",
+            reported.trim()
         )));
     }
     Ok(())
@@ -509,13 +806,44 @@ mod tests {
     #[test]
     fn accepts_only_https_urls() {
         assert!(validate_https_url("http://example.test/a").is_err());
-        assert!(validate_https_url("https://example.test/a").is_ok());
+        assert!(validate_https_url("https://example.test/a").is_err());
+        assert_eq!(
+            validate_https_url("https://www.lua.org/ftp/lua-5.4.8.tar.gz"),
+            LuaVersion::parse("5.4.8")
+        );
     }
 
     #[test]
     fn rejects_archive_traversal() {
         assert!(validate_archive_path("../escape").is_err());
+        assert!(validate_archive_path(r"..\escape").is_err());
+        assert!(validate_archive_path("/absolute").is_err());
         assert!(validate_archive_path("lua-5.4.8/src/lua.c").is_ok());
+    }
+
+    #[test]
+    fn rejects_shell_metacharacters_in_build_values() {
+        let profile = BuildProfile {
+            cflags: vec!["-DNAME=$(touch pwned)".to_owned()],
+            ..BuildProfile::default()
+        };
+        assert!(validate_build_values(&profile).is_err());
+    }
+
+    #[test]
+    fn parses_official_release_checksum() {
+        let html = r#"
+            <A HREF="lua-5.4.8.tar.gz">lua-5.4.8.tar.gz</A>
+            <TD>2025-05-21</TD><TD>374332</TD>
+            <TD>4f18ddae154e793e46eeab727c59ef1c0c0c2b744e7b94219710d76f530629ae</TD>
+        "#;
+        let releases = parse_release_index(html);
+        assert_eq!(releases.as_ref().map(Vec::len), Ok(1));
+        let release = releases.ok().and_then(|mut values| values.pop());
+        assert_eq!(
+            release.as_ref().and_then(|value| value.sha256.as_deref()),
+            Some("4f18ddae154e793e46eeab727c59ef1c0c0c2b744e7b94219710d76f530629ae")
+        );
     }
 
     #[test]

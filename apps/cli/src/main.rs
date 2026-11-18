@@ -3,8 +3,9 @@
 
 use std::env;
 use std::fs;
+use std::io::{self, Write};
 use std::path::Path;
-use std::process::{Command, ExitCode};
+use std::process::{Command, ExitCode, Stdio};
 
 use luavm_core::{BuildProfile, LuaVersion, ProfileId};
 use luavm_engine::{InstallRequest, Manager, SelectionReport, help_text};
@@ -23,18 +24,24 @@ fn main() -> ExitCode {
 
 fn run(args: Vec<String>) -> Result<()> {
     let command = args.first().map(String::as_str).unwrap_or("help");
+    match command {
+        "help" | "--help" | "-h" => {
+            print!("{}", help_text());
+            return Ok(());
+        },
+        "version" | "--version" | "-V" => {
+            println!("luavm 0.1.0");
+            return Ok(());
+        },
+        "doctor" => return doctor(&args),
+        "shell-init" => return shell_init(&args),
+        "completions" => return completions(&args),
+        _ => {},
+    }
     let root = DataRoot::from_environment()?;
     let manager = Manager::open(root);
     let cwd = env::current_dir().map_err(|error| Error::Io(error.to_string()))?;
     match command {
-        "help" | "--help" | "-h" => {
-            print!("{}", help_text());
-            Ok(())
-        },
-        "version" | "--version" | "-V" => {
-            println!("luavm 0.1.0");
-            Ok(())
-        },
         "detect" => detect(&manager, &cwd, args.iter().any(|value| value == "--json")),
         "current" => current(&manager, &cwd, args.iter().any(|value| value == "--json")),
         "global" => global(&manager, &args),
@@ -50,24 +57,26 @@ fn run(args: Vec<String>) -> Result<()> {
         ),
         "uninstall" => uninstall(&manager, &args),
         "install" => install(&manager, &args),
-        "shell-init" => shell_init(&args),
-        "completions" => completions(&args),
         _ => Err(Error::InvalidInput(format!(
             "unknown command `{command}`; run `luavm help`"
         ))),
     }
 }
 
-fn parse_version(args: &[String]) -> Result<LuaVersion> {
-    let value = args
-        .get(1)
-        .ok_or_else(|| Error::InvalidInput("a Lua version is required".to_owned()))?;
+fn parse_lua_version(value: &str) -> Result<LuaVersion> {
     if matches!(value.to_ascii_lowercase().as_str(), "luajit" | "luarocks") {
         return Err(Error::Unsupported(
             "LuaVM supports official Lua releases only".to_owned(),
         ));
     }
     LuaVersion::parse(value)
+}
+
+fn parse_version(args: &[String]) -> Result<LuaVersion> {
+    let value = args
+        .get(1)
+        .ok_or_else(|| Error::InvalidInput("a Lua version is required".to_owned()))?;
+    parse_lua_version(value)
 }
 
 fn parse_profile(args: &[String]) -> Result<Option<ProfileId>> {
@@ -77,6 +86,11 @@ fn parse_profile(args: &[String]) -> Result<Option<ProfileId>> {
     let value = args
         .get(position + 1)
         .ok_or_else(|| Error::InvalidInput("--profile requires a profile id".to_owned()))?;
+    if value.starts_with('-') {
+        return Err(Error::InvalidInput(
+            "--profile requires a non-flag profile id".to_owned(),
+        ));
+    }
     Ok(Some(ProfileId::new(value.clone())?))
 }
 
@@ -105,10 +119,163 @@ fn detect(manager: &Manager, cwd: &Path, json: bool) -> Result<()> {
     print_report(&report, json)
 }
 
+fn doctor(args: &[String]) -> Result<()> {
+    let json = args.iter().any(|value| value == "--json");
+    let fix = args.iter().any(|value| value == "--fix");
+    if json && fix {
+        return Err(Error::InvalidInput("--json and --fix cannot be combined".to_owned()));
+    }
+    let statuses = Installer.prerequisites();
+    let healthy = statuses.iter().all(|status| status.available);
+    print_doctor_status(&statuses, json);
+    if healthy {
+        return Ok(());
+    }
+    if !fix {
+        return Err(Error::NotFound(
+            "source builds require the missing host prerequisites shown above; rerun with --fix to opt in to installation".to_owned(),
+        ));
+    }
+    let steps = prerequisite_install_steps();
+    if steps.is_empty() {
+        return Err(Error::NotFound(
+            "no supported package manager was found; install the missing prerequisites manually".to_owned(),
+        ));
+    }
+    println!("LuaVM will run these prerequisite installation commands:");
+    for (program, arguments) in &steps {
+        println!("  {} {}", program, arguments.join(" "));
+    }
+    print!("Continue? [y/N] ");
+    io::stdout().flush().map_err(|error| Error::Io(error.to_string()))?;
+    let mut answer = String::new();
+    io::stdin()
+        .read_line(&mut answer)
+        .map_err(|error| Error::Io(error.to_string()))?;
+    if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        return Err(Error::Conflict("prerequisite installation was cancelled".to_owned()));
+    }
+    for (program, arguments) in steps {
+        let status = Command::new(&program)
+            .args(&arguments)
+            .status()
+            .map_err(|error| Error::Process(format!("unable to run {program}: {error}")))?;
+        if !status.success() {
+            return Err(Error::Process(format!("{program} exited with {status}")));
+        }
+    }
+    let statuses = Installer.prerequisites();
+    let healthy = statuses.iter().all(|status| status.available);
+    print_doctor_status(&statuses, false);
+    if healthy {
+        Ok(())
+    } else {
+        Err(Error::NotFound(
+            "prerequisite installation completed; restart the shell if PATH changed, then rerun `luavm doctor`"
+                .to_owned(),
+        ))
+    }
+}
+
+fn print_doctor_status(statuses: &[luavm_io::installer::PrerequisiteStatus], json: bool) {
+    if json {
+        let values = statuses
+            .iter()
+            .map(|status| {
+                format!(
+                    "{{\"name\":{},\"available\":{},\"hint\":{}}}",
+                    json_string(Some(status.name.as_str())),
+                    status.available,
+                    json_string(Some(status.hint.as_str()))
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let ready = statuses.iter().all(|status| status.available);
+        println!("{{\"schema\":1,\"ready\":{},\"prerequisites\":[{values}]}}", ready);
+    } else {
+        for status in statuses {
+            let marker = if status.available { "ok" } else { "missing" };
+            println!("[{marker}] {} — {}", status.name, status.hint);
+        }
+    }
+}
+
+fn prerequisite_install_steps() -> Vec<(String, Vec<String>)> {
+    if cfg!(windows) && command_exists("winget") {
+        return vec![(
+            "winget".to_owned(),
+            vec![
+                "install".to_owned(),
+                "--exact".to_owned(),
+                "--id".to_owned(),
+                "BrechtSanders.WinLibs.POSIX.UCRT".to_owned(),
+                "--accept-source-agreements".to_owned(),
+                "--accept-package-agreements".to_owned(),
+            ],
+        )];
+    }
+    if cfg!(target_os = "macos") {
+        return vec![("/usr/bin/xcode-select".to_owned(), vec!["--install".to_owned()])];
+    }
+    if cfg!(unix) {
+        if command_exists("apt-get") {
+            return vec![
+                ("sudo".to_owned(), vec!["apt-get".to_owned(), "update".to_owned()]),
+                (
+                    "sudo".to_owned(),
+                    vec![
+                        "apt-get".to_owned(),
+                        "install".to_owned(),
+                        "-y".to_owned(),
+                        "build-essential".to_owned(),
+                    ],
+                ),
+            ];
+        }
+        if command_exists("dnf") {
+            return vec![(
+                "sudo".to_owned(),
+                vec![
+                    "dnf".to_owned(),
+                    "install".to_owned(),
+                    "-y".to_owned(),
+                    "make".to_owned(),
+                    "gcc".to_owned(),
+                ],
+            )];
+        }
+        if command_exists("pacman") {
+            return vec![(
+                "sudo".to_owned(),
+                vec![
+                    "pacman".to_owned(),
+                    "-S".to_owned(),
+                    "--needed".to_owned(),
+                    "--noconfirm".to_owned(),
+                    "make".to_owned(),
+                    "gcc".to_owned(),
+                ],
+            )];
+        }
+    }
+    Vec::new()
+}
+
+fn command_exists(command: &str) -> bool {
+    Command::new(command)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
 fn current(manager: &Manager, cwd: &Path, json: bool) -> Result<()> {
     let active = env::var("LUAVM_ACTIVE_VERSION")
         .ok()
-        .map(|value| LuaVersion::parse(&value))
+        .map(|value| parse_lua_version(&value))
         .transpose()?;
     let report = manager.resolve(active, true, cwd)?;
     if report.selection.version.is_none() && !json {
@@ -153,19 +320,29 @@ fn path(manager: &Manager, args: &[String]) -> Result<()> {
 
 fn install(manager: &Manager, args: &[String]) -> Result<()> {
     let version = parse_version(args)?;
+    ensure_prerequisites(args)?;
     let cflags = repeated_values(args, "--cflag")?;
     let ldflags = repeated_values(args, "--ldflag")?;
     let make_args = repeated_values(args, "--make-arg")?;
-    let official_sha256 = option_value(args, "--sha256");
+    let explicit_sha256 = option_value(args, "--sha256")?;
     let allow_unverified = args.iter().any(|value| value == "--allow-unverified");
+    let release = Installer.release(version)?;
+    if let (Some(expected), Some(actual)) = (explicit_sha256.as_deref(), release.sha256.as_deref())
+        && !expected.eq_ignore_ascii_case(actual)
+    {
+        return Err(Error::Conflict(
+            "the supplied checksum does not match the official release catalog".to_owned(),
+        ));
+    }
+    let official_sha256 = explicit_sha256.or(release.sha256);
     if official_sha256.is_none() && !allow_unverified {
         return Err(Error::InvalidInput(
-            "this build has no remote checksum catalog; pass --sha256 or --allow-unverified explicitly".to_owned(),
+            "this release has no official checksum; pass --allow-unverified explicitly".to_owned(),
         ));
     }
     let request = InstallRequest {
         version,
-        archive_url: format!("https://www.lua.org/ftp/lua-{version}.tar.gz"),
+        archive_url: release.archive_url,
         official_sha256,
         profile: BuildProfile {
             cflags,
@@ -182,6 +359,20 @@ fn install(manager: &Manager, args: &[String]) -> Result<()> {
     println!("path: {}", result.path.display());
     println!("sha256: {}", result.sha256);
     Ok(())
+}
+
+fn ensure_prerequisites(args: &[String]) -> Result<()> {
+    let statuses = Installer.prerequisites();
+    if statuses.iter().all(|status| status.available) {
+        return Ok(());
+    }
+    if args.iter().any(|value| value == "--no-prerequisites") {
+        return Err(Error::NotFound(
+            "source build prerequisites are missing; run `luavm doctor --fix`".to_owned(),
+        ));
+    }
+    let fix_args = vec!["doctor".to_owned(), "--fix".to_owned()];
+    doctor(&fix_args)
 }
 
 fn shell_init(args: &[String]) -> Result<()> {
@@ -206,16 +397,16 @@ fn completions(args: &[String]) -> Result<()> {
     let shell = args.get(1).map(String::as_str).unwrap_or("bash");
     match shell {
         "bash" => println!(
-            "_luavm() {{ COMPREPLY=( $(compgen -W 'help version install uninstall list use global local detect current env exec path shell-init completions' -- \"${{COMP_WORDS[1]}}\") ); }}\ncomplete -F _luavm luavm"
+            "_luavm() {{ COMPREPLY=( $(compgen -W 'help version doctor install uninstall list use global local detect current env exec path shell-init completions' -- \"${{COMP_WORDS[1]}}\") ); }}\ncomplete -F _luavm luavm"
         ),
         "zsh" => println!(
-            "#compdef luavm\n_arguments '1:command:(help version install uninstall list use global local detect current env exec path shell-init completions)'"
+            "#compdef luavm\n_arguments '1:command:(help version doctor install uninstall list use global local detect current env exec path shell-init completions)'"
         ),
         "fish" => println!(
-            "complete -c luavm -f -a 'help version install uninstall list use global local detect current env exec path shell-init completions'"
+            "complete -c luavm -f -a 'help version doctor install uninstall list use global local detect current env exec path shell-init completions'"
         ),
         "powershell" => println!(
-            "Register-ArgumentCompleter -CommandName luavm -ScriptBlock {{ param($wordToComplete) 'help','version','install','uninstall','list','use','global','local','detect','current','env','exec','path','shell-init','completions' | Where-Object {{ $_ -like \"$wordToComplete*\" }} }}"
+            "Register-ArgumentCompleter -CommandName luavm -ScriptBlock {{ param($wordToComplete) 'help','version','doctor','install','uninstall','list','use','global','local','detect','current','env','exec','path','shell-init','completions' | Where-Object {{ $_ -like \"$wordToComplete*\" }} }}"
         ),
         _ => return Err(Error::InvalidInput(format!("unsupported shell `{shell}`"))),
     }
@@ -236,7 +427,7 @@ fn environment(manager: &Manager, cwd: &Path, args: &[String]) -> Result<()> {
     let explicit = args
         .get(1)
         .filter(|value| !value.starts_with('-'))
-        .map(|value| LuaVersion::parse(value))
+        .map(|value| parse_lua_version(value))
         .transpose()?;
     let report = manager.resolve(explicit, args.iter().any(|value| value == "--project"), cwd)?;
     let path = report
@@ -248,7 +439,7 @@ fn environment(manager: &Manager, cwd: &Path, args: &[String]) -> Result<()> {
             path.display()
         )));
     }
-    let shell = option_value(args, "--shell").unwrap_or_else(|| "bash".to_owned());
+    let shell = option_value(args, "--shell")?.unwrap_or_else(|| "bash".to_owned());
     let bin = path.join("bin");
     let current_path = env::var("PATH").unwrap_or_default();
     print_shell_environment(&shell, &bin, &current_path, report.selection.version)
@@ -265,7 +456,7 @@ fn execute(manager: &Manager, cwd: &Path, args: &[String]) -> Result<()> {
     let explicit = args
         .get(1)
         .filter(|value| !value.starts_with('-'))
-        .map(|value| LuaVersion::parse(value))
+        .map(|value| parse_lua_version(value))
         .transpose()?;
     let report = manager.resolve(explicit, args.iter().any(|value| value == "--project"), cwd)?;
     let path = report
@@ -418,11 +609,17 @@ fn print_report(report: &SelectionReport, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn option_value(args: &[String], name: &str) -> Option<String> {
-    args.iter()
-        .position(|value| value == name)
-        .and_then(|position| args.get(position + 1))
-        .cloned()
+fn option_value(args: &[String], name: &str) -> Result<Option<String>> {
+    let Some(position) = args.iter().position(|value| value == name) else {
+        return Ok(None);
+    };
+    let value = args
+        .get(position + 1)
+        .ok_or_else(|| Error::InvalidInput(format!("{name} requires a value")))?;
+    if value.starts_with('-') {
+        return Err(Error::InvalidInput(format!("{name} requires a non-flag value")));
+    }
+    Ok(Some(value.clone()))
 }
 
 fn prepend_path(bin: &Path, current: &str) -> String {
