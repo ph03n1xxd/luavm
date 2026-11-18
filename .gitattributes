@@ -1,0 +1,15 @@
+# Use LF for source, configuration, and documentation files.
+* text=auto eol=lf
+*.ps1 text eol=crlf
+
+# Binary assets
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ico binary
+*.icns binary
+*.pdf binary
+*.ttf binary
+*.otf binary
+*.woff2 binary
+*.wasm binary
