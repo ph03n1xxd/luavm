@@ -534,6 +534,10 @@ fn list(manager: &Manager, json: bool, available: bool) -> Result<()> {
         {
             continue;
         }
+        let version_path = entry.path();
+        if !has_installed_profile(&version_path)? {
+            continue;
+        }
         if let Ok(version) = LuaVersion::parse(&entry.file_name().to_string_lossy()) {
             versions.push(version);
         }
@@ -552,6 +556,26 @@ fn list(manager: &Manager, json: bool, available: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn has_installed_profile(version_path: &Path) -> Result<bool> {
+    let profiles = version_path.join("profiles");
+    let entries = match fs::read_dir(profiles) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(Error::Io(error.to_string())),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|error| Error::Io(error.to_string()))?;
+        if entry
+            .file_type()
+            .map_err(|error| Error::Io(error.to_string()))?
+            .is_dir()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn uninstall(manager: &Manager, args: &[String]) -> Result<()> {
@@ -712,6 +736,7 @@ fn json_string(value: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn install_stage_messages_are_not_empty() {
@@ -723,5 +748,19 @@ mod tests {
         ] {
             assert!(!install_stage_message(stage).is_empty());
         }
+    }
+
+    #[test]
+    fn empty_version_directories_are_not_reported_as_installed() {
+        let suffix = match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(value) => value.as_nanos(),
+            Err(_) => return,
+        };
+        let version_path = env::temp_dir().join(format!("luavm-list-test-{}-{suffix}", std::process::id()));
+        if fs::create_dir_all(version_path.join("profiles")).is_err() {
+            return;
+        }
+        assert!(matches!(has_installed_profile(&version_path), Ok(false)));
+        let _ = fs::remove_dir_all(version_path);
     }
 }
