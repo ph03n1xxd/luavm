@@ -80,4 +80,4 @@ jobs:
           mkdir -p release-assets
           find dist -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec cp {} release-assets/ \;
           (cd release-assets && sha256sum *.tar.gz *.zip > SHA256SUMS)
-          gh release create "$GITHUB_REF_NAME" release-assets/* --generate-notes
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" release-assets/* --generate-notes
