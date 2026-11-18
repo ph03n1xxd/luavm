@@ -312,7 +312,7 @@ impl Installer {
         command.current_dir(source).arg(target);
         command.args(&profile.make_args);
         command.arg("install");
-        command.arg(format!("INSTALL_TOP={}", install_root.display()));
+        command.arg(format!("INSTALL_TOP={}", make_tool_path(install_root)));
         if !profile.cflags.is_empty() {
             command.env("MYCFLAGS", profile.cflags.join(" "));
         }
@@ -490,6 +490,11 @@ fn platform_build_tool() -> (String, &'static str, &'static str) {
     } else {
         ("make".to_owned(), "posix", "Install the system make package")
     }
+}
+
+fn make_tool_path(path: &Path) -> String {
+    let value = path.to_string_lossy().into_owned();
+    if cfg!(windows) { value.replace('\\', "/") } else { value }
 }
 
 fn command_available(command_name: &str) -> bool {
@@ -828,6 +833,21 @@ mod tests {
             ..BuildProfile::default()
         };
         assert!(validate_build_values(&profile).is_err());
+    }
+
+    #[test]
+    fn formats_paths_for_the_platform_build_tool() {
+        let path = if cfg!(windows) {
+            Path::new(r"D:\a\_temp\luavm\install")
+        } else {
+            Path::new("/tmp/luavm/install")
+        };
+        let formatted = make_tool_path(path);
+        if cfg!(windows) {
+            assert_eq!(formatted, "D:/a/_temp/luavm/install");
+        } else {
+            assert_eq!(formatted, "/tmp/luavm/install");
+        }
     }
 
     #[test]
