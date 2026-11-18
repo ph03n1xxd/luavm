@@ -9,6 +9,6 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
-luavm-util.workspace = true
-luavm-core.workspace = true
-luavm-io.workspace = true
+luavm-util = { path = "../util" }
+luavm-core = { path = "../core" }
+luavm-io = { path = "../io" }

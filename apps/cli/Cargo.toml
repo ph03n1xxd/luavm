@@ -9,7 +9,7 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
-luavm-util.workspace = true
-luavm-core.workspace = true
-luavm-io.workspace = true
-luavm-engine.workspace = true
+luavm-util = { path = "../../crates/util" }
+luavm-core = { path = "../../crates/core" }
+luavm-io = { path = "../../crates/io" }
+luavm-engine = { path = "../../crates/engine" }

@@ -1,12 +1,9 @@
 [advisories]
-version = 2
-vulnerability = "deny"
-unmaintained = "warn"
+unmaintained = "all"
 yanked = "deny"
 
 [licenses]
 version = 2
-unlicensed = "deny"
 allow = [
     "MIT",
     "Apache-2.0",
@@ -14,7 +11,6 @@ allow = [
     "BSD-3-Clause",
     "ISC",
     "CC0-1.0",
-    "Unicode-DFS-2016",
     "OFL-1.1",
     "Ubuntu-font-1.0",
     "Bitstream-Vera",
@@ -23,14 +19,14 @@ allow = [
     "LicenseRef-Public-Domain",
 ]
 confidence-threshold = 0.8
+unused-allowed-license = "allow"
 
 [bans]
-version = 2
 multiple-versions = "warn"
-wildcards = "deny"
+# Workspace path dependencies are declared with Cargo's workspace shorthand.
+wildcards = "warn"
 
 [sources]
-version = 2
-unknown-registries = "deny"
+unknown-registry = "deny"
 unknown-git = "deny"
 allow-git = []

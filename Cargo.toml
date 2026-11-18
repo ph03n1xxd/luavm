@@ -32,9 +32,3 @@ opt-level = 2
 codegen-units = 1
 lto = "thin"
 strip = true
-
-[workspace.dependencies]
-luavm-util = { path = "crates/util" }
-luavm-core = { path = "crates/core" }
-luavm-io = { path = "crates/io" }
-luavm-engine = { path = "crates/engine" }
