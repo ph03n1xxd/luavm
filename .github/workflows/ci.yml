@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    name: Gate (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install nextest and cargo-deny
+        uses: taiki-e/install-action@51c6c59b207559fa543f45c22502c38d5db07be9 # v2.49.18
+        with:
+          tool: cargo-nextest@0.9.150,cargo-deny@0.20.2
+
+      - name: Code Formatting Check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy Linter
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Run Tests (nextest)
+        run: cargo nextest run --profile ci --workspace
+
+      - name: Run Documentation Tests
+        run: cargo test --workspace --doc
+
+      - name: Check Layer Hierarchy
+        run: cargo run -p xtask -- layers
+        if: always()
+
+      - name: Cargo Deny (Licenses & Advisories)
+        run: cargo deny check
+        if: runner.os == 'Linux'
