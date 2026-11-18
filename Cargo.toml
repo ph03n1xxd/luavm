@@ -1,0 +1,40 @@
+[workspace]
+resolver = "3"
+members = ["apps/*", "crates/*", "xtask"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.85"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+indexing_slicing = "deny"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = true
+
+[workspace.dependencies]
+luavm-util = { path = "crates/util" }
+luavm-core = { path = "crates/core" }
+luavm-io = { path = "crates/io" }
+luavm-engine = { path = "crates/engine" }

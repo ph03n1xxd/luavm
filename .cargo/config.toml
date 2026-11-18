@@ -1,0 +1,4 @@
+[alias]
+xtask = "run -p xtask --"
+lint = "clippy --workspace --all-targets -- -D warnings"
+test-ci = "nextest run --profile ci"

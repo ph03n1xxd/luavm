@@ -1,0 +1,13 @@
+[package]
+name = "luavm-io"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+luavm-util.workspace = true
+luavm-core.workspace = true
