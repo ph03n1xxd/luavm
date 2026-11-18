@@ -25,6 +25,11 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
 
     steps:
+      - name: Configure Windows checkout line endings
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: git config --global core.autocrlf input
+
       - name: Checkout Code
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -36,9 +41,18 @@ jobs:
           components: rustfmt, clippy
 
       - name: Install nextest and cargo-deny
-        uses: taiki-e/install-action@51c6c59b207559fa543f45c22502c38d5db07be9 # v2.49.18
+        uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         with:
-          tool: cargo-nextest@0.9.150,cargo-deny@0.20.2
+          tool: cargo-nextest@0.9.152,cargo-deny@0.20.2
+
+      - name: Set up Windows source-build toolchain
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@d34ca6fb9f66412423e0ade249ca8a35b3715726 # v2.33.0
+        with:
+          msystem: UCRT64
+          path-type: inherit
+          update: true
+          install: mingw-w64-ucrt-x86_64-toolchain
 
       - name: Code Formatting Check
         run: cargo fmt --all -- --check
@@ -55,6 +69,32 @@ jobs:
       - name: Check Layer Hierarchy
         run: cargo run -p xtask -- layers
         if: always()
+
+      - name: Check source-build prerequisites (Unix)
+        if: runner.os != 'Windows'
+        run: cargo run --locked -p luavm -- doctor --json
+
+      - name: Check source-build prerequisites (Windows)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: cargo run --locked -p luavm -- doctor --json
+
+      - name: Build official Lua source (Unix)
+        if: runner.os != 'Windows'
+        env:
+          LUAVM_DATA_ROOT: ${{ runner.temp }}/luavm-source-smoke
+        run: |
+          cargo run --locked -p luavm -- install 5.4.8 --no-prerequisites
+          cargo run --locked -p luavm -- exec 5.4.8 -- lua -v
+
+      - name: Build official Lua source (Windows)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        env:
+          LUAVM_DATA_ROOT: ${{ runner.temp }}/luavm-source-smoke
+        run: |
+          cargo run --locked -p luavm -- install 5.4.8 --no-prerequisites
+          cargo run --locked -p luavm -- exec 5.4.8 -- lua -v
 
       - name: Cargo Deny (Licenses & Advisories)
         run: cargo deny check
