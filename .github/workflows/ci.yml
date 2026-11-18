@@ -47,6 +47,7 @@ jobs:
 
       - name: Set up Windows source-build toolchain
         if: runner.os == 'Windows'
+        id: msys2
         uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2.33.0
         with:
           msystem: UCRT64
@@ -76,8 +77,13 @@ jobs:
 
       - name: Check source-build prerequisites (Windows)
         if: runner.os == 'Windows'
-        shell: msys2 {0}
-        run: cargo run --locked -p luavm -- doctor --json
+        shell: powershell
+        run: |
+          $msys2 = "${{ steps.msys2.outputs.msys2-location }}"
+          $ucrt64 = Join-Path $msys2 "ucrt64/bin"
+          $msys = Join-Path $msys2 "usr/bin"
+          $env:PATH = "$ucrt64;$msys;$env:PATH"
+          cargo run --locked -p luavm -- doctor --json
 
       - name: Build official Lua source (Unix)
         if: runner.os != 'Windows'
@@ -89,10 +95,14 @@ jobs:
 
       - name: Build official Lua source (Windows)
         if: runner.os == 'Windows'
-        shell: msys2 {0}
+        shell: powershell
         env:
           LUAVM_DATA_ROOT: ${{ runner.temp }}/luavm-source-smoke
         run: |
+          $msys2 = "${{ steps.msys2.outputs.msys2-location }}"
+          $ucrt64 = Join-Path $msys2 "ucrt64/bin"
+          $msys = Join-Path $msys2 "usr/bin"
+          $env:PATH = "$ucrt64;$msys;$env:PATH"
           cargo run --locked -p luavm -- install 5.4.8 --no-prerequisites
           cargo run --locked -p luavm -- exec 5.4.8 -- lua -v
 
