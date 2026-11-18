@@ -135,6 +135,8 @@ The executable is written to `target/release/luavm` or `target/release/luavm.exe
 
 LuaVM 0.1.0 is an active release candidate. The core install, isolation, selection, shell, and Windows source-build workflows are implemented. Cross-platform acceptance testing, documentation refinement, and release hardening are still ongoing.
 
+macOS is supported by LuaVM, but macOS GitHub Actions builds are currently disabled because the hosted Intel runner has been unreliable to provision. Linux and Windows remain covered by continuous integration.
+
 ## Contributing
 
 Keep changes narrow, add regression coverage, and run the checks in [Development and releases](docs/development.md). Changes to `main` are made through pull requests.
