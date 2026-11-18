@@ -38,15 +38,25 @@ jobs:
       - name: Build
         run: cargo build --locked --release -p luavm
 
-      - name: Package
+      - name: Package Unix archive
+        if: runner.os != 'Windows'
         shell: bash
         run: |
-          mkdir -p dist
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            cp target/release/luavm.exe "dist/luavm-${{ matrix.name }}.exe"
-          else
-            cp target/release/luavm "dist/luavm-${{ matrix.name }}"
-          fi
+          package="dist/luavm-${{ matrix.name }}"
+          mkdir -p "$package"
+          cp target/release/luavm "$package/luavm"
+          cp README.md LICENSE "$package/"
+          tar -czf "dist/luavm-${{ matrix.name }}.tar.gz" -C dist "luavm-${{ matrix.name }}"
+
+      - name: Package Windows archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $package = "dist/luavm-${{ matrix.name }}"
+          New-Item -ItemType Directory -Path $package -Force | Out-Null
+          Copy-Item target/release/luavm.exe "$package/luavm.exe"
+          Copy-Item README.md, LICENSE $package
+          Compress-Archive -Path "$package/*" -DestinationPath "dist/luavm-${{ matrix.name }}.zip" -Force
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -70,5 +80,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p release-assets
-          find dist -type f -exec cp {} release-assets/ \;
+          find dist -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec cp {} release-assets/ \;
+          (cd release-assets && sha256sum *.tar.gz *.zip > SHA256SUMS)
           gh release create "$GITHUB_REF_NAME" release-assets/* --generate-notes
